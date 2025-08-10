@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ProfitPulse — Auth & Live Preview</title>
+
+  <!-- Chart.js (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+
+  <style>
+    :root{
+      --bg:#071024; --card:#0b1220; --muted:#94a3b8; --accent:#06b6d4;
+    }
+    body{margin:0;font-family:Inter,system-ui,Arial;background:linear-gradient(180deg,#071024,#071724);color:#e6eef6}
+    .wrap{max-width:1100px;margin:28px auto;padding:18px}
+    header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+    .brand{font-weight:800;color:var(--accent);font-size:20px}
+    .card{background:var(--card);padding:16px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,0.6)}
+    .grid{display:grid;grid-template-columns:1fr 360px;gap:16px}
+    @media(max-width:900px){.grid{grid-template-columns:1fr}}
+    .small{color:var(--muted);font-size:13px}
+    .btn{background:linear-gradient(90deg,var(--accent),#7c3aed);border:none;color:#04111b;padding:8px 12px;border-radius:8px;cursor:pointer}
+    .muted{color:var(--muted)}
+    .balance{font-size:18px;font-weight:600}
+    canvas{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));border-radius:8px}
+    pre{white-space:pre-wrap;color:#cfeefb;background:#061024;padding:12px;border-radius:8px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div>
+        <div class="brand">ProfitPulse</div>
+        <div class="small">Deriv-style demo — Sign-in verification & live ticks</div>
+      </div>
+      <div style="display:flex;gap:10px;align-items:center">
+        <a class="btn" id="affiliateBtn" target="_blank" rel="noreferrer">Sign up (Referrals)</a>
+        <a class="small muted" href="/"><small>Home</small></a>
+      </div>
+    </header>
+
+    <div class="grid">
+      <section class="card">
+        <h3>Account verification</h3>
+        <div class="small muted">This page parses the redirect from Deriv and attempts to authorize the returned token.</div>
+        <div style="margin-top:12px">
+          <div id="status" class="muted">Waiting for redirect data...</div>
+          <div id="acct" style="margin-top:12px"></div>
+        </div>
+
+        <hr style="margin:14px 0;border:none;border-top:1px solid rgba(255,255,255,0.03)">
+
+        <h3>Live preview — ticks chart</h3>
+        <div class="small muted">Subscribe to live ticks for a symbol and watch the chart update in real-time (demo).</div>
+
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <input id="symbol" value="R_100" style="padding:8px;border-radius:8px;background:transparent;border:1px solid rgba(255,255,255,0.05);color:#e6eef6" />
+          <button id="subBtn" class="btn">Subscribe</button>
+        </div>
+
+        <div style="margin-top:12px">
+          <canvas id="ticksChart" height="200"></canvas>
+        </div>
+
+        <div id="log" style="margin-top:10px" class="muted small"></div>
+      </section>
+
+      <aside class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <div class="small muted">Connection</div>
+            <div id="connState" class="balance">—</div>
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <div class="small muted">Balance</div>
+          <div id="balance" class="balance">—</div>
+        </div>
+
+        <div style="margin-top:12px">
+          <div class="small muted">Returned redirect data</div>
+          <pre id="params">No data yet</pre>
+        </div>
+
+        <div style="margin-top:12px" class="small muted">
+          Security: For production, exchange codes server-side and never store tokens in client JS.
+        </div>
+      </aside>
+    </div>
+  </div>
+
+<script>
+/*
+  Auth & Live Ticks demo page
+  - Parses redirect params (fragment or query)
+  - If a usable token found (session_token, access_token, token, authorize), calls WebSocket authorize
+  - Subscribes to live ticks and plots them (Chart.js)
+  - Uses your Deriv app_id (93535) and affiliate token (2cqUY1SFYvHYlkH)
+  - To deploy to /auth/ create this file at auth/index.html
+*/
+
+const APP_ID = 93535;                    // your app id
+const AFFILIATE_TOKEN = '2cqUY1SFYvHYlkH';
+const OAUTH_REDIRECT = 'https://profitpulse.com/auth'; // registered redirect (change if needed)
+
+document.getElementById('affiliateBtn').href = `https://hub.deriv.com/tradershub/signup?t=${encodeURIComponent(AFFILIATE_TOKEN)}&utm_campaign=profitpulse`;
+
+// helper: parse fragment or query string
+function parseRedirectParams() {
+  const url = window.location.href;
+  let paramsString = '';
+  if (url.includes('#')) paramsString = url.split('#')[1];
+  else if (url.includes('?')) paramsString = url.split('?')[1];
+  if (!paramsString) return {};
+  const sp = new URLSearchParams(paramsString);
+  const out = {};
+  for (const [k,v] of sp.entries()) out[k]=v;
+  return out;
+}
+
+// Chart.js setup for ticks
+const ctx = document.getElementById('ticksChart').getContext('2d');
+const tickData = { labels: [], datasets: [{ label: 'Tick', data: [], tension: 0.2, pointRadius: 0 }] };
+const chart = new Chart(ctx, {
+  type: 'line',
+  data: tickData,
+  options: {
+    animation:false,
+    plugins:{legend:{display:false}},
+    scales:{ x:{display:false}, y:{ticks:{color:'#cfeefb'}}}
+  }
+});
+
+let ws = null;
+let currentTickSymbol = 'R_100';
+
+// connect WebSocket (without authorizing) to show connection state and allow authorize later
+function connectSocket() {
+  ws = new WebSocket('wss://ws.binaryws.com/websockets/v3?app_id=' + APP_ID);
+  document.getElementById('connState').textContent = 'connecting...';
+  ws.addEventListener('open', ()=> {
+    document.getElementById('connState').textContent = 'connected';
+    log('WS open');
+  });
+  ws.addEventListener('close', ()=> document.getElementById('connState').textContent = 'closed');
+  ws.addEventListener('error', (e)=> { document.getElementById('connState').textContent = 'error'; log('WS error'); });
+  ws.addEventListener('message', (evt)=> {
+    try {
+      const data = JSON.parse(evt.data);
+      // handle ticks
+      if (data.tick && data.tick.quote !== undefined) {
+        pushTick(data.tick.quote);
+      }
+      // handle authorize response
+      if (data.authorize) {
+        document.getElementById('acct').innerHTML = `<div class="small muted">Logged in as</div><div class="muted">${data.authorize.login}</div>`;
+        document.getElementById('balance').textContent = (data.authorize.balance ?? '—') + ' ' + (data.authorize.currency ?? 'USD');
+        log('Authorize success');
+      }
+      if (data.error) {
+        log('Error: ' + JSON.stringify(data.error));
+      }
+    } catch(e) { /* ignore parse errors */ }
+  });
+}
+
+// subscribe to ticks for symbol
+function subscribeTicks(symbol) {
+  if (!ws || ws.readyState !== 1) return log('Socket not connected');
+  currentTickSymbol = symbol;
+  ws.send(JSON.stringify({ ticks: symbol }));
+  log('Subscribed to ' + symbol);
+  document.getElementById('log').textContent = 'Subscribed to ' + symbol;
+}
+
+// push tick to chart (keep last N)
+function pushTick(value) {
+  const labels = tickData.labels;
+  const data = tickData.datasets[0].data;
+  const t = new Date().toLocaleTimeString();
+  labels.push(t);
+  data.push(Number(value));
+  if (labels.length > 30) { labels.shift(); data.shift(); }
+  chart.update('none');
+}
+
+// small logging helper
+function log(msg) {
+  const el = document.getElementById('log');
+  el.textContent = (new Date().toLocaleTimeString()) + ' — ' + msg;
+}
+
+// parse redirect params and attempt authorize if token present
+function handleRedirectAndAuth() {
+  const params = parseRedirectParams();
+  document.getElementById('params').textContent = JSON.stringify(params, null, 2);
+  if (!params || Object.keys(params).length === 0) {
+    document.getElementById('status').textContent = 'No redirect data found. If you came from OAuth, tokens may be in the fragment/hash. Try the Deriv redirect again.';
+    return;
+  }
+  document.getElementById('status').textContent = 'Redirect data found. Attempting to verify...';
+
+  // look for common token fields
+  const token = params.session_token || params.access_token || params.token || params.authorize;
+  if (!token) {
+    document.getElementById('status').textContent = 'No usable token in redirect params. You may have a code that requires server-side exchange.';
+    return;
+  }
+
+  // authorize on websocket to prove token validity (demo only)
+  if (!ws || ws.readyState !== 1) connectSocket();
+  const handler = (evt) => {
+    // handled in global message listener
+  };
+  // send authorize request
+  setTimeout(()=> {
+    try {
+      ws.send(JSON.stringify({ authorize: token }));
+      log('Sent authorize request');
+    } catch(e) {
+      log('Authorize send failed: ' + e.toString());
+    }
+  }, 300);
+}
+
+// initial connect and UI wiring
+connectSocket();
+
+document.getElementById('subBtn').addEventListener('click', ()=> {
+  const sym = document.getElementById('symbol').value.trim() || 'R_100';
+  subscribeTicks(sym);
+});
+
+// on load try parse redirect and authorize
+window.addEventListener('load', ()=> {
+  // If user arrived with OAuth redirect, parse/authorize
+  handleRedirectAndAuth();
+});
+</script>
+</body>
+  </html>
